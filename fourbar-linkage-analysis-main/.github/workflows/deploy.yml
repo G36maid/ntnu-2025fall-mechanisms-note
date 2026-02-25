@@ -1,0 +1,192 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  # =============================================================================
+  # Job 1: Quality Check (Rust & Python)
+  # =============================================================================
+  check:
+    name: Quality Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -------------------------------------------------------------------------
+      # Python Setup and Validation
+      # -------------------------------------------------------------------------
+      - name: Install uv (Python package manager)
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Run Python figure generation (validation)
+        run: uv run pyscript/generate_figures.py
+
+      - name: Upload generated figures as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: figures
+          path: figures/*.png
+          retention-days: 7
+
+      # -------------------------------------------------------------------------
+      # Rust Setup and Quality Checks
+      # -------------------------------------------------------------------------
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Check code formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy (linter)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run unit tests
+        run: cargo test --verbose
+
+      - name: Build native binary (test)
+        run: cargo build --release
+
+  # =============================================================================
+  # Job 2: Build WASM
+  # =============================================================================
+  build:
+    name: Build WASM
+    needs: check
+    runs-on: ubuntu-latest
+
+    # Only build on push to main branch
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -------------------------------------------------------------------------
+      # Rust Setup for WASM
+      # -------------------------------------------------------------------------
+      - name: Setup Rust toolchain with WASM target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # -------------------------------------------------------------------------
+      # Install Trunk (WASM bundler)
+      # -------------------------------------------------------------------------
+      - name: Install Trunk
+        uses: jetli/trunk-action@v0.5.0
+        with:
+          version: "latest"
+
+      # -------------------------------------------------------------------------
+      # Build WASM Application
+      # -------------------------------------------------------------------------
+      - name: Build WASM with Trunk
+        run: |
+          trunk build --release --public-url /${{ github.event.repository.name }}/
+
+      # -------------------------------------------------------------------------
+      # Optimize WASM binary (optional but recommended)
+      # -------------------------------------------------------------------------
+      - name: Optimize WASM
+        run: |
+          echo "WASM build complete. Size before optimization:"
+          du -h dist/*.wasm || echo "No WASM files found"
+
+      # -------------------------------------------------------------------------
+      # Add documentation to dist folder
+      # -------------------------------------------------------------------------
+      - name: Copy documentation
+        run: |
+          cp README.md dist/ || echo "README.md not copied"
+          cp LICENSE dist/ || echo "LICENSE not copied"
+          mkdir -p dist/figures
+          cp figures/*.png dist/figures/ || echo "Figures not copied"
+
+      # -------------------------------------------------------------------------
+      # Upload build artifacts to GitHub Pages
+      # -------------------------------------------------------------------------
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: "./dist"
+
+  # =============================================================================
+  # Job 3: Deploy to GitHub Pages
+  # =============================================================================
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+
+    # Deploy on main branch only
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      # -------------------------------------------------------------------------
+      # Deploy to GitHub Pages
+      # -------------------------------------------------------------------------
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      # -------------------------------------------------------------------------
+      # Output deployment URL
+      # -------------------------------------------------------------------------
+      - name: Output deployment info
+        run: |
+          echo "🚀 Deployment successful!"
+          echo "📦 Application URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/"
+          echo "⏰ Deployed at: $(date)"
+
+  # =============================================================================
+  # Job 4: Build Status Summary (runs on PR)
+  # =============================================================================
+  summary:
+    name: Build Summary
+    runs-on: ubuntu-latest
+    needs: check
+    if: always()
+    steps:
+      - name: Check build status
+        run: |
+          if [ "${{ needs.check.result }}" == "success" ]; then
+            echo "✅ All checks passed!"
+            echo "Ready for deployment to GitHub Pages"
+          else
+            echo "❌ Build failed"
+            echo "Please check the logs above for details"
+            exit 1
+          fi
